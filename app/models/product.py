@@ -30,7 +30,7 @@ class Product(Base):
     stock_quantity: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[ProductStatus] = mapped_column(
         Enum(
-            ProductStatus,
+            ProductStatus, 
             name="product_status",
             values_callable=lambda enum_cls: [member.value for member in enum_cls],
         ),
@@ -44,3 +44,4 @@ class Product(Base):
     )
 
     category: Mapped["Category"] = relationship("Category", back_populates="products")
+    

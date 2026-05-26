@@ -2,18 +2,22 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
+from celery.utils.collections import force_mapping
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import asc, desc, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from app import celery_app
 from app.api.deps import get_current_user
 from app.db.session import get_db
 from app.models.category import Category
 from app.models.product import Product, ProductStatus
 from app.models.user import User
 from app.schemas.product import (
+    BulkGenerateProductsRequest,
     ProductCreate,
     ProductListParams,
     ProductListResponse,
@@ -22,6 +26,10 @@ from app.schemas.product import (
     ProductUpdate,
     SortOrder,
 )
+from app.services.generate_csv import generate_csv_file
+from app.services.generate_excel import generate_xlsx_file
+from app.tasks.bulk_generate import bulk_generate_products_task
+from openpyxl import Workbook
 
 router = APIRouter(prefix="/products", tags=["products"])
 
@@ -40,12 +48,16 @@ def _active_product_filter():
 
 
 def _get_active_product(db: Session, product_id: int) -> Product | None:
-    return db.scalar(select(Product).where(Product.id == product_id, _active_product_filter()))
+    return db.scalar(
+        select(Product).where(Product.id == product_id, _active_product_filter())
+    )
 
 
 def _ensure_category_exists(db: Session, category_id: int) -> None:
     if db.get(Category, category_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Category not found"
+        )
 
 
 def _apply_list_filters(stmt: Any, params: ProductListParams) -> Any:
@@ -95,7 +107,9 @@ def _list_params(
             include_deleted=include_deleted,
         )
     except ValidationError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.errors()) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=exc.errors()
+        ) from exc
 
 
 @router.get("", response_model=ProductListResponse)
@@ -108,10 +122,17 @@ def list_products(
     total = db.scalar(count_stmt) or 0
 
     sort_column = SORT_COLUMNS[params.sort_by]
-    order_clause = desc(sort_column) if params.order == SortOrder.DESC else asc(sort_column)
+    order_clause = (
+        desc(sort_column) if params.order == SortOrder.DESC else asc(sort_column)
+    )
 
     offset = (params.page - 1) * params.page_size
-    stmt = _apply_list_filters(select(Product), params).order_by(order_clause).offset(offset).limit(params.page_size)
+    stmt = (
+        _apply_list_filters(select(Product), params)
+        .order_by(order_clause)
+        .offset(offset)
+        .limit(params.page_size)
+    )
     items = list(db.scalars(stmt).all())
 
     return ProductListResponse(
@@ -131,7 +152,9 @@ def get_product(
 ) -> Product:
     product = _get_active_product(db, product_id)
     if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+        )
     return product
 
 
@@ -166,7 +189,9 @@ def update_product(
 ) -> Product:
     product = _get_active_product(db, product_id)
     if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+        )
 
     if payload.category_id is not None:
         _ensure_category_exists(db, payload.category_id)
@@ -195,7 +220,74 @@ def delete_product(
 ) -> None:
     product = _get_active_product(db, product_id)
     if product is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+        )
 
     product.deleted_at = datetime.now(UTC)
     db.commit()
+
+
+@router.post("products/bulk-generate")
+def bulk_generate_products(
+    payload: BulkGenerateProductsRequest,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+) -> None:
+
+    # add function for celert
+    print(f"Generating {payload.count} products for category {payload.category_id}")
+    task = bulk_generate_products_task.delay(payload.category_id, payload.count)
+    return {
+        "task_id": task.id,
+    }
+
+
+@router.get("/tasks/{task_id}")
+def get_task_status(task_id: str) -> dict[str, Any]:
+    task = bulk_generate_products_task.AsyncResult(task_id)
+    response = {
+        "status": task.status,
+        "task_id": task_id,
+    }
+    return response
+
+
+@router.get("products/export")
+def export_products(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+    params: Annotated[ProductListParams, Depends(_list_params)],
+    format: str = Query(default="xlsx", enum=["xlsx", "csv"]),
+) -> None:
+    count_stmt = _apply_list_filters(select(func.count()).select_from(Product), params)
+    total = db.scalar(count_stmt) or 0
+
+    sort_column = SORT_COLUMNS[params.sort_by]
+    order_clause = (
+        desc(sort_column) if params.order == SortOrder.DESC else asc(sort_column)
+    )
+
+    offset = (params.page - 1) * params.page_size
+    stmt = (
+        _apply_list_filters(select(Product), params)
+        .order_by(order_clause)
+        .offset(offset)
+        .limit(params.page_size)
+    )
+    items = list(db.scalars(stmt).all())
+
+    if format == "xlsx":
+        file = generate_xlsx_file(items)
+        return FileResponse(
+            path=file,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if format == "csv":
+
+        file = generate_csv_file(items)
+        return StreamingResponse(
+            content=file,
+            media_type="text/csv",
+        )

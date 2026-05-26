@@ -76,3 +76,8 @@ class ProductListParams(BaseModel):
         if self.min_price is not None and self.max_price is not None and self.min_price > self.max_price:
             raise ValueError("min_price cannot be greater than max_price")
         return self
+
+
+class BulkGenerateProductsRequest(BaseModel):
+    category_id: int
+    count: int = Field(default=1000, ge=1 , le=5000)
